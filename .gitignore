@@ -1,0 +1,5 @@
+sign_env/
+__pycache__/
+*.pyc
+raw_videos/
+*.pkl
