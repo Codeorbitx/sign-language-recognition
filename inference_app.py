@@ -1,31 +1,57 @@
 """
 Live Demo (UI) for Isolated Sign Recognition — Push-to-Sign version
 ------------------------------------------------------------
-Instead of guessing continuously in the background (which didn't match how
-the training videos were recorded), this version has a "Capture Sign" button.
-When pressed, it records for exactly RECORD_SECONDS (same length as
-record_videos.py) and then classifies that clip — matching the training data
-much more closely, which gives far more reliable predictions.
+CLOUD-COMPATIBLE VERSION
+------------------------------------------------------------
+This version replaces two things that only work on your own computer with
+versions that work when this app is deployed to a cloud server:
 
-RUN:
+1. Camera: cv2.VideoCapture(0) -> streamlit-webrtc
+   streamlit-webrtc streams video from the VIEWER'S browser (their own
+   webcam) to this script, instead of trying to open a camera that is
+   physically attached to the server (which doesn't exist).
+
+2. Speech: pyttsx3 -> gTTS + st.audio
+   pyttsx3 speaks through the SERVER's speakers (which don't exist on a
+   cloud machine). gTTS instead generates an mp3 file, which is sent to
+   the browser and played through the VIEWER's own speakers.
+
+Everything else (your model, feature extraction, mediapipe logic) is
+UNCHANGED.
+
+RUN LOCALLY:
     pip install -r requirements.txt
     streamlit run inference_app.py
+
+DEPLOY:
+    Make sure requirements.txt includes (add these if missing):
+        streamlit-webrtc
+        av
+        gTTS
+        opencv-python-headless   (instead of opencv-python, for servers)
 """
+
+import io
+import threading
+import time
+from collections import deque
 
 import streamlit as st
 import cv2
 import numpy as np
 import pickle
-import time
 import os
 import glob
 import mediapipe as mp
-import pyttsx3
+from gtts import gTTS
+import av
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
 MODEL_PATH = "sign_classifier.pkl"
 RAW_VIDEOS_DIR = "raw_videos"
 RECORD_SECONDS = 2.5     # MUST match RECORD_SECONDS in record_videos.py
 CONFIDENCE_THRESHOLD = 0.35
+ASSUMED_FPS = 24         # buffer sizing only; actual frames used = whatever arrives
 
 mp_holistic = mp.solutions.holistic
 
@@ -96,6 +122,8 @@ def list_demo_videos():
 
 
 def classify_video_file(video_path, model):
+    # Unchanged: this reads an already-recorded FILE, not a live camera,
+    # so cv2.VideoCapture(path) is fine on a server.
     cap = cv2.VideoCapture(video_path)
     frame_feats = []
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
@@ -114,6 +142,41 @@ def classify_video_file(video_path, model):
     probs = model.predict_proba(pooled)[0]
     best_idx = np.argmax(probs)
     return model.classes_[best_idx], probs[best_idx]
+
+
+def speak_text(text):
+    """Generate speech audio in the cloud and play it through the VIEWER's
+    browser speakers (instead of pyttsx3, which needs a local sound device)."""
+    text = text.strip()
+    if not text:
+        st.warning("Nothing to speak yet — capture a sign first.")
+        return
+    try:
+        tts = gTTS(text=text, lang="en")
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        st.audio(buf, format="audio/mp3")
+    except Exception as e:
+        st.error(f"Could not generate speech: {e}")
+
+
+class CameraBuffer(VideoProcessorBase):
+    """Continuously receives frames from the viewer's browser webcam.
+    While `recording` is True, frames are copied into a buffer so the
+    main thread can grab them after RECORD_SECONDS."""
+
+    def __init__(self):
+        self.frames = deque(maxlen=int(RECORD_SECONDS * ASSUMED_FPS) + 30)
+        self.recording = False
+        self.lock = threading.Lock()
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        if self.recording:
+            with self.lock:
+                self.frames.append(img.copy())
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 def main():
@@ -135,14 +198,22 @@ def main():
 
 
 def run_live_tab(model):
-    st.caption("Position yourself in frame, then press the button and perform ONE sign.")
+    st.caption(
+        "Click 'START' below to allow camera access in your browser, "
+        "position yourself in frame, then press Capture and perform ONE sign."
+    )
 
     col1, col2 = st.columns([2, 1])
-    frame_placeholder = col1.empty()
-    status_placeholder = col1.empty()
     text_placeholder = col2.empty()
-
     text_placeholder.markdown(f"### {' '.join(st.session_state.sentence_tokens)}")
+
+    with col1:
+        ctx = webrtc_streamer(
+            key="live-sign",
+            video_processor_factory=CameraBuffer,
+            media_stream_constraints={"video": True, "audio": False},
+        )
+        status_placeholder = st.empty()
 
     capture = col2.button("📸 Capture Sign (2.5s)", type="primary", key="live_capture")
     c1, c2 = col2.columns(2)
@@ -154,27 +225,24 @@ def run_live_tab(model):
         text_placeholder.markdown("### ")
 
     if speak:
-        engine = pyttsx3.init()
-        engine.say(" ".join(st.session_state.sentence_tokens))
-        engine.runAndWait()
+        speak_text(" ".join(st.session_state.sentence_tokens))
 
     if capture:
-        cap = cv2.VideoCapture(0)
-        raw_frames = []
-        start_time = time.time()
+        if ctx.video_processor is None:
+            status_placeholder.warning("Please click START above to enable your camera first.")
+            return
 
-        while time.time() - start_time < RECORD_SECONDS:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            raw_frames.append(frame)
-            elapsed = time.time() - start_time
-            display_frame = frame.copy()
-            cv2.putText(display_frame, f"REC {elapsed:.1f}s / {RECORD_SECONDS}s", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            frame_placeholder.image(display_frame, channels="BGR")
+        status_placeholder.info(f"Recording for {RECORD_SECONDS}s... perform your sign now.")
 
-        cap.release()
+        with ctx.video_processor.lock:
+            ctx.video_processor.frames.clear()
+        ctx.video_processor.recording = True
+        time.sleep(RECORD_SECONDS)
+        ctx.video_processor.recording = False
+
+        with ctx.video_processor.lock:
+            raw_frames = list(ctx.video_processor.frames)
+
         status_placeholder.info("Processing...")
 
         frame_feats = []
@@ -184,7 +252,10 @@ def run_live_tab(model):
                 frame_feats.append(extract_landmarks(results))
 
         if len(frame_feats) < 5:
-            status_placeholder.error("Not enough frames captured from the camera. Please try again.")
+            status_placeholder.error(
+                "Not enough frames captured from the camera. "
+                "Make sure your camera is started (green 'LIVE' indicator) and try again."
+            )
         else:
             pooled = pool_clip(frame_feats).reshape(1, -1)
             probs = model.predict_proba(pooled)[0]
@@ -196,7 +267,9 @@ def run_live_tab(model):
                 st.session_state.sentence_tokens.append(pred_label)
                 status_placeholder.success(f"Detected: {pred_label} ({confidence:.0%})")
             else:
-                status_placeholder.warning(f"Not confident enough: {pred_label} ({confidence:.0%}) — sign not added.")
+                status_placeholder.warning(
+                    f"Not confident enough: {pred_label} ({confidence:.0%}) — sign not added."
+                )
 
             text_placeholder.markdown(f"### {' '.join(st.session_state.sentence_tokens)}")
 
@@ -229,9 +302,7 @@ def run_demo_tab(model):
     if d1.button("Clear Sentence", key="demo_clear"):
         st.session_state.sentence_tokens = []
     if d2.button("🔊 Speak", key="demo_speak"):
-        engine = pyttsx3.init()
-        engine.say(" ".join(st.session_state.sentence_tokens))
-        engine.runAndWait()
+        speak_text(" ".join(st.session_state.sentence_tokens))
 
 
 if __name__ == "__main__":
