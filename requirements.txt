@@ -1,5 +1,5 @@
 opencv-python-headless
-mediapipe==0.10.14
+mediapipe==1.0.1
 numpy
 pandas
 scikit-learn
