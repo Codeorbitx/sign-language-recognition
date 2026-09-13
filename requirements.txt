@@ -1,7 +1,9 @@
-opencv-python
+opencv-python-headless
 mediapipe
 numpy
 pandas
 scikit-learn
 streamlit
-pyttsx3
+streamlit-webrtc
+av
+gTTS
