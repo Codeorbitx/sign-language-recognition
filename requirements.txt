@@ -1,4 +1,3 @@
-opencv-python-headless
 mediapipe==0.10.32
 numpy
 pandas
